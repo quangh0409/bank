@@ -1,0 +1,5 @@
+def main(field balance, field amount) -> field {
+    field c = balance > amount ? 1 : 0;
+    assert(c == 1);
+    return c;
+}
