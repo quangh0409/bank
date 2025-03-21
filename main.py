@@ -4,13 +4,15 @@
 import logging
 from flask import Flask, request, jsonify
 from pymongo import MongoClient, GEOSPHERE
-import pytest
 import requests
 import subprocess
 import json
 import os
 from bson import ObjectId
 from geopy.distance import geodesic
+import uuid
+import hmac
+import hashlib
 
 # ========================== LỚP 1: QUẢN LÝ DANH TÍNH VÀ NGƯỜI DÙNG ==========================
 # Setup logging
@@ -24,6 +26,17 @@ db = client["zkp_bank"]
 users_collection = db["users"]
 transactions_collection = db["transactions"]
 
+# Cấu hình MoMo
+MOMO_CONFIG = {
+    "endpoint": "https://test-payment.momo.vn/v2/gateway/api/create",
+    "accessKey": "F8BBA842ECF85",
+    "secretKey": "K951B6PE1waDMi640xX08PD3vg6EkVlz",
+    "partnerCode": "MOMO",
+    "redirectUrl": "https://webhook.site/b3088a6a-2d17-4f8d-a383-71389a6c600b",
+    "ipnUrl": "https://webhook.site/b3088a6a-2d17-4f8d-a383-71389a6c600b",
+    "lang": "vi"
+}
+
 # Tạo geospatial index cho truy vấn theo vị trí (chạy 1 lần)
 try:
     transactions_collection.create_index([("location", GEOSPHERE)])
@@ -32,20 +45,63 @@ except Exception as e:
 
 # ========================== LỚP 2: XÁC MINH GIAO DỊCH VỚI ZKP ==========================
 # Save transaction to MongoDB với thông tin vị trí
-def save_transaction(user_id, amount, status, lat, lng):
-    """Lưu trữ giao dịch kèm thông tin vị trí địa lý"""
-    transaction = {
-        "user_id": user_id,
-        "amount": amount,
-        "status": status,
-        "location": {
-            "type": "Point",
-            "coordinates": [lng, lat]  # Chuẩn GeoJSON: [kinh độ, vĩ độ]
-        },
-        "timestamp": subprocess.getoutput('date -Iseconds')  # Thời gian giao dịch
-    }
-    transactions_collection.insert_one(transaction)
-    logging.info(f"Đã lưu giao dịch với GPS: {transaction}")
+def save_transaction(user_id, amount, status, reason, lat, lng, payment_info=None):
+    """Lưu trữ giao dịch kèm thông tin vị trí địa lý và thanh toán"""
+    logging.info("Bắt đầu lưu giao dịch")
+    
+    try:
+        # Kiểm tra kết nối MongoDB
+        db.command('ping')
+        logging.info("Kết nối MongoDB thành công")
+        
+        # Tạo timestamp
+        from datetime import datetime
+        timestamp = datetime.now().isoformat()
+        logging.info(f"Timestamp: {timestamp}")
+        
+        # Tạo đối tượng transaction
+        transaction = {
+            "user_id": user_id,
+            "amount": amount,
+            "status": status,
+            "reason": reason,
+            "location": {
+                "type": "Point",
+                "coordinates": [lng, lat]  # Chuẩn GeoJSON: [kinh độ, vĩ độ]
+            },
+            "timestamp": timestamp
+        }
+        logging.info("Đã tạo transaction object")
+        
+        # Xử lý payment_info
+        if payment_info:
+            logging.info(f"Payment info nhận được: {payment_info}")
+            if isinstance(payment_info, str):
+                try:
+                    payment_info = json.loads(payment_info)
+                    logging.info("Đã parse payment_info từ JSON string")
+                except json.JSONDecodeError as e:
+                    logging.error(f"Lỗi decode payment_info: {str(e)}")
+                    payment_info = None
+            elif not isinstance(payment_info, dict):
+                logging.error(f"payment_info không phải dictionary: {type(payment_info)}")
+                payment_info = None
+            
+            if payment_info:
+                transaction["payment_info"] = payment_info
+                logging.info("Đã thêm payment_info vào transaction")
+        
+        # Log thông tin giao dịch
+        logging.info(f"Giao dịch: {json.dumps(transaction, indent=2, ensure_ascii=False)}")
+        
+        # Lưu vào database
+        logging.info("Bắt đầu lưu vào MongoDB")
+        result = transactions_collection.insert_one(transaction)
+        logging.info(f"Đã lưu giao dịch với ID: {result.inserted_id}")
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi lưu giao dịch: {str(e)}", exc_info=True)
+        raise
 
 # Function to generate and verify ZKP using ZoKrates CLI
 def generate_proof(balance, amount):
@@ -87,6 +143,7 @@ def generate_proof(balance, amount):
         for cmd in commands:
             # Thực thi từng lệnh và kiểm tra kết quả
             result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            logging.info(f"Command: {cmd}")
             logging.info(f"Command output: {result.stdout}")
         return True
     except subprocess.CalledProcessError as e:
@@ -136,7 +193,7 @@ def create_user():
 
 @app.route('/transaction/verify', methods=['POST'])
 def verify_transaction():
-    """Xác thực giao dịch với ZKP và kiểm tra vị trí"""
+    """Xác thực giao dịch với ZKP và tích hợp thanh toán MoMo"""
     data = request.json
     
     # Kiểm tra các trường bắt buộc
@@ -145,39 +202,75 @@ def verify_transaction():
         return jsonify({"error": f"Thiếu trường bắt buộc: {required_fields}"}), 400
     
     try:
-        # Chuyển đổi và kiểm tra tọa độ
+        # Validate và chuyển đổi tọa độ
         lat = float(data["lat"])
         lng = float(data["lng"])
         if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
-            raise ValueError
+            raise ValueError("Tọa độ không hợp lệ")
             
-        # Tìm user trong database
+        # Tìm thông tin user
         user = users_collection.find_one({"_id": ObjectId(data["user_id"])})
+        logging.info(user)
         if not user:
             return jsonify({"error": "Không tìm thấy user"}), 404
         
         # Xác minh bằng ZKP
         if generate_proof(user["balance"], data["amount"]):
+            logging.info("Tạo thanh toán MoMo")
+            # Tạo thanh toán MoMo
+            momo_response = create_momo_payment(
+                amount=data["amount"],
+                order_info=f"Thanh toán cho user {data['user_id']}"
+            )
+            
+            if momo_response.get("resultCode") != 0:
+                return jsonify({
+                    "status": "ERROR",
+                    "message": "Không thể tạo thanh toán",
+                    "momo_error": momo_response
+                }), 400
+            
             # Cập nhật số dư và lưu giao dịch
             new_balance = user["balance"] - data["amount"]
             users_collection.update_one(
                 {"_id": ObjectId(data["user_id"])}, 
                 {"$set": {"balance": new_balance}}
             )
-            save_transaction(data["user_id"], data["amount"], "APPROVED", lat, lng)
+            
+            save_transaction(
+                user_id=data["user_id"],
+                amount=data["amount"],
+                status="APPROVED",
+                reason="Xác minh thành công",
+                lat=lat,
+                lng=lng,
+                payment_info=momo_response
+            )
+            
             return jsonify({
                 "status": "APPROVED",
                 "new_balance": new_balance,
-                "location": {"lat": lat, "lng": lng}
+                "payment_url": momo_response.get("payUrl"),
+                "momo_order_id": momo_response.get("orderId")
             }), 200
         else:
-            save_transaction(data["user_id"], data["amount"], "DENIED", lat, lng)
-            return jsonify({"status": "DENIED", "reason": "Xác minh ZKP thất bại"}), 403
-            
-    except ValueError:
-        return jsonify({"error": "Tọa độ GPS không hợp lệ"}), 400
+            save_transaction(
+                user_id=data["user_id"],
+                amount=data["amount"],
+                status="DENIED", 
+                reason="Xác minh số dư thất bại",
+                lat=lat,
+                lng=lng
+            )
+            return jsonify({
+                "status": "DENIED",
+                "reason": "Không thể xác minh số dư"
+            }), 403
+
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        logging.error(f"Lỗi giao dịch: {str(e)}")
+        logging.error(f"Lỗi hệ thống: {str(e)}")
         return jsonify({"error": "Xử lý giao dịch thất bại"}), 500
 
 @app.route('/transactions', methods=['GET'])
@@ -212,7 +305,58 @@ def get_transactions():
     except Exception as e:
         logging.error(str(e))
         return jsonify({"error": "Lỗi database"}), 500
-
+    
+@app.route('/payment', methods=['POST'])
+def create_momo_payment(amount, order_info):
+    """Tạo yêu cầu thanh toán qua MoMo"""
+    try:
+        order_id = str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        
+        raw_signature = f"accessKey={MOMO_CONFIG['accessKey']}&amount={amount}&extraData=&ipnUrl={MOMO_CONFIG['ipnUrl']}" \
+                        f"&orderId={order_id}&orderInfo={order_info}&partnerCode={MOMO_CONFIG['partnerCode']}" \
+                        f"&redirectUrl={MOMO_CONFIG['redirectUrl']}&requestId={request_id}&requestType=payWithMethod"
+        
+        signature = hmac.new(
+            bytes(MOMO_CONFIG['secretKey'], 'utf-8'),
+            bytes(raw_signature, 'utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        data = {
+            'partnerCode': MOMO_CONFIG['partnerCode'],
+            'orderId': order_id,
+            'partnerName': "MoMo Payment",
+            'storeId': "Test Store",
+            'ipnUrl': MOMO_CONFIG['ipnUrl'],
+            'amount': amount,
+            'lang': MOMO_CONFIG['lang'],
+            'requestType': "payWithMethod",
+            'redirectUrl': MOMO_CONFIG['redirectUrl'],
+            'autoCapture': True,
+            'orderInfo': order_info,
+            'requestId': request_id,
+            'extraData': "",
+            'signature': signature,
+            'orderGroupId': ""
+        }
+        
+        logging.info(f"MoMo request data: {json.dumps(data, indent=2)}")
+        
+        response = requests.post(
+            MOMO_CONFIG['endpoint'],
+            data=json.dumps(data),
+            headers={'Content-Type': 'application/json'},
+            timeout=30
+        )
+        
+        logging.info(f"MoMo response: {response.status_code} - {response.text}")
+        
+        return response.json()
+    
+    except Exception as e:
+        logging.error(f"Lỗi khi tạo thanh toán MoMo: {str(e)}", exc_info=True)
+        return {"resultCode": -1, "message": str(e)}
 # ========================== LỚP 4: LƯU TRỮ DỮ LIỆU VÀ LỊCH SỬ ==========================
 def test_transaction_flow():
     """Kiểm tra toàn bộ luồng giao dịch với ZKP và GPS"""
